@@ -1,0 +1,1042 @@
+From 8994f2e7a2070bc57cf1c7415498cbdb046fe7ae Mon Sep 17 00:00:00 2001
+From: Kevin Yang <yangkevin@meta.com>
+Date: Tue, 25 Jul 2023 21:14:37 -0700
+Subject: [PATCH] rlcd modifications
+
+---
+ examples/best_of_n.py                         |  92 +++++++++-------
+ examples/reward_modeling.py                   |  34 +++---
+ examples/rlhf_ppo.py                          |  11 +-
+ examples/scripts/evaluate_outputs.py          |  53 ++++++++++
+ .../evaluate_reward_model_human_agreement.py  |  76 +++++++++++++
+ examples/scripts/reward_modeling.sh           |   7 +-
+ examples/scripts/rlhf_ppo.sh                  |  15 +--
+ examples/scripts/sft.sh                       |   9 +-
+ examples/supervised.py                        |  34 +++---
+ .../convert_llama7b_to_alpacafarm_format.py   | 100 ++++++++++++++++++
+ src/alpaca_farm/common.py                     |   2 +-
+ src/alpaca_farm/data_preprocessor.py          |  19 +++-
+ src/alpaca_farm/data_utils.py                 |  97 +++++++++++++----
+ src/alpaca_farm/inference/decode.py           |   8 +-
+ src/alpaca_farm/inference/score.py            |   3 +-
+ src/alpaca_farm/reward_modeling_trainer.py    |   7 +-
+ src/alpaca_farm/rl/ppo_trainer.py             |  13 ++-
+ src/alpaca_farm/rl/ppo_utils.py               |   1 +
+ src/alpaca_farm/rl/rl_trainer.py              |   3 +-
+ 19 files changed, 461 insertions(+), 123 deletions(-)
+ create mode 100644 examples/scripts/evaluate_outputs.py
+ create mode 100644 examples/scripts/evaluate_reward_model_human_agreement.py
+ create mode 100644 pretrained_models/convert_llama7b_to_alpacafarm_format.py
+
+diff --git a/examples/best_of_n.py b/examples/best_of_n.py
+index b4d3159..709f2d4 100644
+--- a/examples/best_of_n.py
++++ b/examples/best_of_n.py
+@@ -65,13 +65,18 @@ def run_decode(
+         List of dict data with keys.
+         If num_return_sequences > 1, each 'completion' is a list of strings. Otherwise, it is a string.
+     """
+-    dataset = datasets.load_dataset(dataset_path, dataset_name)
+-
+-    prompts, list_dict_data, metadata = data_preprocessor.format_prompt_with_data_frame(
+-        df=pd.DataFrame(dataset[split]),
+-        prompt_dict=utils.jload(prompt_dict_path),
+-    )
+-    prompts, list_dict_data = prompts[:max_instances], list_dict_data[:max_instances]
++    try:
++        dataset = datasets.load_dataset(dataset_path, dataset_name)
++
++        prompts, list_dict_data, metadata = data_preprocessor.format_prompt_with_data_frame(
++            df=pd.DataFrame(dataset[split]),
++            prompt_dict=utils.jload(prompt_dict_path),
++        )
++        prompts, list_dict_data = prompts[:max_instances], list_dict_data[:max_instances]
++    except:
++        data = pd.read_csv(dataset_name)
++        prompts = data['instruction'].tolist()[:max_instances]
++        list_dict_data = [{'instruction': prompt, 'input': ''} for prompt in prompts]
+ 
+     outputs = decode.decode_prompts_with_huggingface(
+         model_name_or_path=decoder_name_or_path,
+@@ -84,6 +89,12 @@ def run_decode(
+         tf32=tf32,
+         seed=seed,
+     )
++    for i in range(len(outputs)):
++        if type(outputs[i]) == str:
++            outputs[i] = [outputs[i]]
++        for j in range(len(outputs[i])):
++            if '\n\nHuman:' in outputs[i][j]:
++                outputs[i][j] = outputs[i][j].split('\n\nHuman:')[0]
+ 
+     sample_mode = sample_mode_formatter.format(temperature=temperature, max_new_tokens=max_new_tokens, seed=seed)
+     return_list_dict_data = [
+@@ -129,15 +140,15 @@ def run_rerank(
+     Returns:
+         Rerank results as a list of dict data.
+     """
+-    if isinstance(list_dict_data_or_path, AnyPath):
+-        list_dict_data_or_path = utils.jload(list_dict_data_or_path)
++    # if isinstance(list_dict_data_or_path, AnyPath):
++    #     list_dict_data_or_path = utils.jload(list_dict_data_or_path)
+ 
+     sequences = [
+         [dict_data["prompt"] + output for output in dict_data["output"]] for dict_data in list_dict_data_or_path
+     ]
+ 
+     # TODO(lxuechen): FlashAttention reward model is not correctly loaded.
+-    top_sequences, top_indices = score.rerank_sequences_with_huggingface(
++    top_sequences, top_indices, top_rewards = score.rerank_sequences_with_huggingface(
+         sequences=sequences,
+         model_name_or_path=scorer_name_or_path,
+         per_device_batch_size=per_device_batch_size,
+@@ -154,9 +165,10 @@ def run_rerank(
+             "output": dict_data["output"],
+             "top_sequence": top_sequence,
+             "top_index": top_index,
++            "top_reward": top_reward, # added for easier logging
+             "scorer_name_or_path": scorer_name_or_path,
+         }
+-        for top_sequence, top_index, dict_data in utils.zip_(top_sequences, top_indices, list_dict_data_or_path)
++        for top_sequence, top_index, top_reward, dict_data in utils.zip_(top_sequences, top_indices, top_rewards, list_dict_data_or_path)
+     ]
+     if output_path is not None and distributed_utils.is_main_process():
+         utils.jdump(return_list_dict_data, output_path)
+@@ -166,23 +178,25 @@ def run_rerank(
+ 
+ def run_best_of_n(
+     decoder_name_or_path: AnyPath,
+-    scorer_name_or_path: AnyPath,
++    # scorer_name_or_path: AnyPath,
++    dataset_name: Optional[str] = "alpaca_farm_evaluation",
+     output_path: AnyPathOrNone = None,
+     prompt_dict_path=pathlib.Path(__file__).parent / "prompts" / "v0_inputs_noinputs.json",
+-    split="val",
+-    per_device_batch_size=4,
++    split="eval",
++    per_device_batch_size=2,
+     max_instances=sys.maxsize,
+     temperature=1.0,
+-    num_return_sequences=4,
++    num_return_sequences=1,
+     max_new_tokens=300,
+-    mixed_precision=None,
+-    tf32=False,
+-    flash_attn=False,
++    mixed_precision="bf16",
++    tf32=True,
++    flash_attn=True,
+ ):
+     """Chain together decoding and rerank."""
+     decode_return_list_dict_data = run_decode(
+         decoder_name_or_path=decoder_name_or_path,
+         prompt_dict_path=prompt_dict_path,
++        dataset_name=dataset_name,
+         split=split,
+         max_instances=max_instances,
+         per_device_batch_size=per_device_batch_size,
+@@ -192,32 +206,32 @@ def run_best_of_n(
+         mixed_precision=mixed_precision,
+         tf32=tf32,
+     )
+-    rerank_return_list_dict_data = run_rerank(
+-        list_dict_data_or_path=decode_return_list_dict_data,
+-        scorer_name_or_path=scorer_name_or_path,
+-        per_device_batch_size=per_device_batch_size,
+-        mixed_precision=mixed_precision,
+-        tf32=tf32,
+-        flash_attn=flash_attn,
+-    )
++    # rerank_return_list_dict_data = run_rerank(
++    #     list_dict_data_or_path=decode_return_list_dict_data,
++    #     scorer_name_or_path=scorer_name_or_path,
++    #     per_device_batch_size=per_device_batch_size,
++    #     mixed_precision=mixed_precision,
++    #     tf32=tf32,
++    #     flash_attn=flash_attn,
++    # )
+ 
+     # Convert best-k-of-n into best-of-n.
+-    return_list_dict_data = [
+-        {
+-            "instruction": rerank_dict_data["instruction"],
+-            "input": rerank_dict_data["input"],
+-            "output": rerank_dict_data["output"][rerank_dict_data["top_index"][0]],
+-            "decoder_name_or_path": decoder_name_or_path,
+-            "scorer_name_or_path": scorer_name_or_path,
+-            "sample_mode": f"best_of_n_{decode_data_dict['sample_mode']}",
+-        }
+-        for decode_data_dict, rerank_dict_data in utils.zip_(decode_return_list_dict_data, rerank_return_list_dict_data)
+-    ]
++    # return_list_dict_data = [
++    #     {
++    #         "instruction": rerank_dict_data["instruction"],
++    #         "input": rerank_dict_data["input"],
++    #         "output": rerank_dict_data["output"][rerank_dict_data["top_index"][0]],
++    #         "decoder_name_or_path": decoder_name_or_path,
++    #         "scorer_name_or_path": scorer_name_or_path,
++    #         "sample_mode": f"best_of_n_{decode_data_dict['sample_mode']}",
++    #     }
++    #     for decode_data_dict, rerank_dict_data in utils.zip_(decode_return_list_dict_data, rerank_return_list_dict_data)
++    # ]
+ 
+     if output_path is not None and distributed_utils.is_main_process():
+-        utils.jdump(return_list_dict_data, output_path)
++        utils.jdump(decode_return_list_dict_data, output_path)
+ 
+-    return return_list_dict_data
++    return decode_return_list_dict_data
+ 
+ 
+ def main(task, **kwargs):
+diff --git a/examples/reward_modeling.py b/examples/reward_modeling.py
+index 76bd8db..cce044b 100644
+--- a/examples/reward_modeling.py
++++ b/examples/reward_modeling.py
+@@ -38,7 +38,8 @@ class ModelArguments:
+ @dataclass
+ class DataArguments:
+     dataset_path: str = field(default="tatsu-lab/alpaca_farm")
+-    dataset_name: Literal["alpaca_human_preference", "alpaca_gpt4_preference", "alpaca_noisy_multi_preference"] = field(
++    # dataset_name: Literal["alpaca_human_preference", "alpaca_gpt4_preference", "alpaca_noisy_multi_preference"] = field(
++    dataset_name: str = field(
+         default="alpaca_noisy_multi_preference",
+         metadata={"help": "Name of the dataset. Fetches the human or GPT-4 preference data."},
+     )
+@@ -66,7 +67,7 @@ class TrainingArguments(transformers.TrainingArguments):
+         },
+     )
+     label_names: List[str] = field(
+-        default_factory=lambda: ["index_0", "index_1", "choice"],
++        default_factory=lambda: ["index_0", "index_1", "choice", "loss_choice"],
+         metadata={
+             "help": "Names of the labels in the dataset. "
+             "This is needed to get transformers.Trainer to not throw those tensors away before `compute_loss`."
+@@ -109,6 +110,21 @@ class TrainingArguments(transformers.TrainingArguments):
+ def main():
+     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
+     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
++
++    tokenizer = transformers.AutoTokenizer.from_pretrained(
++        model_args.model_name_or_path,
++        cache_dir=training_args.cache_dir,
++        model_max_length=training_args.model_max_length,
++        padding_side="left",  # Ensure reward is always extracted at the last token embedding.
++        use_fast=training_args.use_fast_tokenizer,
++    )
++    tokenizer.padding = training_args.padding
++    data_module = data_utils.make_binary_reward_modeling_data_module(
++        tokenizer=tokenizer,
++        data_args=data_args,
++        training_args=training_args,
++    )
++
+     os.environ["WANDB_PROJECT"] = training_args.wandb_project
+ 
+     if training_args.deepspeed is not None:
+@@ -138,20 +154,6 @@ def main():
+         )
+         common.let_model_save_mem_when_zero_grad(model)
+ 
+-    tokenizer = transformers.AutoTokenizer.from_pretrained(
+-        model_args.model_name_or_path,
+-        cache_dir=training_args.cache_dir,
+-        model_max_length=training_args.model_max_length,
+-        padding_side="left",  # Ensure reward is always extracted at the last token embedding.
+-        use_fast=training_args.use_fast_tokenizer,
+-    )
+-    tokenizer.padding = training_args.padding
+-    data_module = data_utils.make_binary_reward_modeling_data_module(
+-        tokenizer=tokenizer,
+-        data_args=data_args,
+-        training_args=training_args,
+-    )
+-
+     trainer = Trainer(
+         model=model,
+         tokenizer=tokenizer,
+diff --git a/examples/rlhf_ppo.py b/examples/rlhf_ppo.py
+index 0c3de89..5e4c975 100644
+--- a/examples/rlhf_ppo.py
++++ b/examples/rlhf_ppo.py
+@@ -30,6 +30,13 @@ def main():
+     parser = transformers.HfArgumentParser((DataArguments, TrainingArguments))
+     data_args, training_args = parser.parse_args_into_dataclasses()
+ 
++    tokenizer: transformers.PreTrainedTokenizer = make_tokenizer(args=training_args)
++    data_module: dict = data_utils.make_rl_data_module(
++        tokenizer=tokenizer, data_args=data_args, training_args=training_args
++    )
++
++    # model_module: dict = make_models(tokenizer=tokenizer, args=training_args)
++
+     accelerator = accelerate_patch.MyAccelerator(
+         gradient_accumulation_steps=training_args.gradient_accumulation_steps,
+         log_with=["wandb"],
+@@ -47,11 +54,7 @@ def main():
+     )
+     logger.warning(accelerator.state, main_process_only=False)  # Each process log their own state.
+ 
+-    tokenizer: transformers.PreTrainedTokenizer = make_tokenizer(args=training_args)
+     model_module: dict = make_models(tokenizer=tokenizer, args=training_args, accelerator=accelerator)
+-    data_module: dict = data_utils.make_rl_data_module(
+-        tokenizer=tokenizer, data_args=data_args, training_args=training_args
+-    )
+ 
+     trainer = PPOTrainer(
+         args=training_args,
+diff --git a/examples/scripts/evaluate_outputs.py b/examples/scripts/evaluate_outputs.py
+new file mode 100644
+index 0000000..c8ed07b
+--- /dev/null
++++ b/examples/scripts/evaluate_outputs.py
+@@ -0,0 +1,53 @@
++import argparse
++import json
++import os
++
++import torch
++from transformers import AutoTokenizer
++from tqdm import trange
++
++from alpaca_farm.models import reward_model
++
++if __name__=='__main__':
++    parser = argparse.ArgumentParser()
++    parser.add_argument('--model-path', type=str)
++    parser.add_argument('--data-path', type=str)
++    parser.add_argument('--output-path', type=str)
++    parser.add_argument('--batch-size', type=int, default=24)
++    parser.add_argument('--limit', type=int, default=10000000)
++    args = parser.parse_args()
++
++    model = reward_model.RewardModel.from_pretrained(args.model_path, flash_attn=False)
++    model = model.eval().cuda()
++
++    # tokenizer = AutoTokenizer.from_pretrained(os.path.expanduser('~') + '/alpaca_farm/pretrained_models/llama7b')
++    tokenizer = AutoTokenizer.from_pretrained('/'.join(os.path.abspath(__file__).split('/')[:-3] + ['pretrained_models', 'llama7b']))
++    tokenizer.padding_side = "left" 
++    tokenizer.pad_token = tokenizer.eos_token # to avoid an error
++
++    def score_texts(texts):
++        if isinstance(texts, str):
++            texts = [texts]
++        with torch.no_grad():
++            input = tokenizer(texts, return_tensors='pt', padding=True).to('cuda')
++            del input['token_type_ids']
++            return model(**input)
++
++    print('model path:', args.model_path)
++    print('data path:', args.data_path)
++    all_rewards = []
++    with open(args.data_path, 'r') as f:
++        data = json.load(f)
++    data = data[:args.limit]
++    for i in trange(0, len(data), args.batch_size):
++        batch = data[i:i+args.batch_size]
++        texts = [d['instruction'].strip() + ' ' + d['output'] + '\n\nHuman:' for d in batch] # our reward model was trained with \n\nHuman: as the end token
++        rewards = score_texts(texts)['rewards'].flatten().cpu().tolist()
++        all_rewards += rewards
++        for reward in rewards:
++            print(reward)
++        for d, r in zip(batch, rewards):
++            d['reward'] = r
++    with open(args.output_path, 'w') as f:
++        json.dump(data, f)
++    print('mean reward:', sum(all_rewards) / len(all_rewards))
+\ No newline at end of file
+diff --git a/examples/scripts/evaluate_reward_model_human_agreement.py b/examples/scripts/evaluate_reward_model_human_agreement.py
+new file mode 100644
+index 0000000..43d2618
+--- /dev/null
++++ b/examples/scripts/evaluate_reward_model_human_agreement.py
+@@ -0,0 +1,76 @@
++import argparse
++import json
++import os
++
++import torch
++from transformers import AutoTokenizer
++from tqdm import trange
++from scipy.special import expit as sigmoid
++
++from alpaca_farm.models import reward_model
++
++if __name__=='__main__':
++    parser = argparse.ArgumentParser()
++    parser.add_argument('--model-path', type=str)
++    parser.add_argument('--data-path', type=str)
++    parser.add_argument('--num-pairs', type=int, default=2000)
++    parser.add_argument('--batch-size', type=int, default=24)
++    parser.add_argument('--interactive', action='store_true', default=False)
++    args = parser.parse_args()
++
++    model = reward_model.RewardModel.from_pretrained(args.model_path, flash_attn=False)
++    model = model.eval().cuda()
++
++    # tokenizer = AutoTokenizer.from_pretrained(os.path.expanduser('~') + '/alpaca_farm/pretrained_models/llama7b')
++    tokenizer = AutoTokenizer.from_pretrained('/'.join(os.path.abspath(__file__).split('/')[:-3] + ['pretrained_models', 'llama7b']))
++    tokenizer.padding_side = "left" 
++    tokenizer.pad_token = tokenizer.eos_token # to avoid an error
++
++    def score_texts(texts):
++        if isinstance(texts, str):
++            texts = [texts]
++        with torch.no_grad():
++            input = tokenizer(texts, return_tensors='pt', padding=True).to('cuda')
++            del input['token_type_ids']
++            return model(**input)
++
++    print('model path:', args.model_path)
++
++    if args.interactive: # to check stuff dynamically if you want to
++        import pdb; pdb.set_trace()
++
++    print('data path:', args.data_path)
++    print('num pairs:', args.num_pairs)
++    
++    correct = 0
++    total = 0
++    correct_prob = 0
++    data = []
++    with open(args.data_path, 'r') as f:
++        for i, line in enumerate(f):
++            if i >= args.num_pairs:
++                break
++            data.append(json.loads(line))
++    for i in trange(0, len(data), args.batch_size):
++        batch = data[i:i+args.batch_size]
++        chosen_texts = [d['chosen'].strip() + '\n\nHuman:' for d in batch] # our reward model was trained with \n\nHuman: as the end token
++        rejected_texts = [d['rejected'].strip() + '\n\nHuman:' for d in batch] # our reward model was trained with \n\nHuman: as the end token
++        chosen_scores = score_texts(chosen_texts)['rewards'].flatten().cpu().tolist()
++        rejected_scores = score_texts(rejected_texts)['rewards'].flatten().cpu().tolist()
++        for j in range(len(batch)):
++            chosen_score = chosen_scores[j]
++            rejected_score = rejected_scores[j]
++            print(i+j)
++            print('c score', chosen_score)
++            print('r score', rejected_score)
++            correct_prob += sigmoid(chosen_score - rejected_score)
++            if chosen_score > rejected_score:
++                print('CORRECT\n')
++                correct += 1
++            else:
++                print('WRONG\n')
++            total += 1
++    print('correct:', correct)
++    print('total:', total)
++    print('binarized accuracy:', correct / total)
++    print('avg correct prob:', correct_prob / total)
+\ No newline at end of file
+diff --git a/examples/scripts/reward_modeling.sh b/examples/scripts/reward_modeling.sh
+index 383d013..717ca1c 100644
+--- a/examples/scripts/reward_modeling.sh
++++ b/examples/scripts/reward_modeling.sh
+@@ -1,7 +1,6 @@
+ output_dir=$1
+-run_name=$2
+-model_name_or_path=$3
+-dataset_name=${4:-"alpaca_noisy_multi_preference"}
++model_name_or_path=$2
++dataset_name=${3:-"alpaca_noisy_multi_preference"}
+ 
+ torchrun --nproc_per_node=8 --master_port=1234 examples/reward_modeling.py \
+   --fp16 False \
+@@ -26,7 +25,7 @@ torchrun --nproc_per_node=8 --master_port=1234 examples/reward_modeling.py \
+   --evaluation_strategy "steps" \
+   --logging_steps 10 \
+   --wandb_project "alpaca_farm" \
+-  --run_name "${run_name}" \
++  --run_name "reward_model_training" \
+   --fsdp "full_shard auto_wrap" \
+   --fsdp_transformer_layer_cls_to_wrap "LlamaDecoderLayer" \
+   --tf32 True \
+diff --git a/examples/scripts/rlhf_ppo.sh b/examples/scripts/rlhf_ppo.sh
+index 05c0f2f..f4aebbf 100644
+--- a/examples/scripts/rlhf_ppo.sh
++++ b/examples/scripts/rlhf_ppo.sh
+@@ -1,13 +1,14 @@
+ output_dir=$1
+-run_name=$2
+-reward_model_name_or_path=$3
+-policy_model_name_or_path=$4
+-kl_coef=${5:-0.0067}
++reward_model_name_or_path=$2
++policy_model_name_or_path=$3
++dataset_name=$4
++total_steps=$5
++kl_coef=${6:-0.0067}
+ 
+ config_file="./examples/accelerate_configs/rlhf_ppo_fsdp_llama_8gpu.yaml"
+ 
+ accelerate launch --config_file "${config_file}" examples/rlhf_ppo.py \
+-  --run_name "${run_name}" \
++  --run_name "ppo_training" \
+   --step_per_device_batch_size 2 \
+   --rollout_per_device_batch_size 32 \
+   --per_device_eval_batch_size 32 \
+@@ -23,4 +24,6 @@ accelerate launch --config_file "${config_file}" examples/rlhf_ppo.py \
+   --total_epochs 10 \
+   --flash_attn True \
+   --prompt_dict_path "./examples/prompts/v0_inputs_noinputs.json" \
+-  --save_steps 20
++  --save_steps 20 \
++  --total_steps "${total_steps}" \
++  --dataset_name "${dataset_name}"
+diff --git a/examples/scripts/sft.sh b/examples/scripts/sft.sh
+index 00c0d7e..67accb2 100644
+--- a/examples/scripts/sft.sh
++++ b/examples/scripts/sft.sh
+@@ -1,6 +1,6 @@
+ output_dir=$1
+-run_name=$2
+-model_name_or_path=$3
++model_name_or_path=$2
++dataset_name=$3
+ 
+ torchrun --nproc_per_node=8 --master_port=1234 examples/supervised.py \
+   --model_name_or_path "${model_name_or_path}" \
+@@ -23,11 +23,12 @@ torchrun --nproc_per_node=8 --master_port=1234 examples/supervised.py \
+   --evaluation_strategy "steps" \
+   --logging_steps 10 \
+   --wandb_project "alpaca_farm" \
+-  --run_name "${run_name}" \
++  --run_name "sft" \
+   --tf32 True \
+   --flash_attn True \
+   --model_max_length 512 \
+   --ddp_timeout 1800 \
+   --fsdp "full_shard auto_wrap" \
+   --fsdp_transformer_layer_cls_to_wrap "LlamaDecoderLayer" \
+-  --train_splits "sft"
++  --train_splits "sft" \
++  --dataset_name "${dataset_name}"
+diff --git a/examples/supervised.py b/examples/supervised.py
+index f5b4dca..958b05b 100644
+--- a/examples/supervised.py
++++ b/examples/supervised.py
+@@ -43,6 +43,10 @@ class DataArguments:
+         default=pathlib.Path(__file__).parent / "prompts" / "v0_inputs_noinputs.json",
+         metadata={"help": "Path to the dictionary for the prompt to format examples."},
+     )
++    eval_size: int = field(
++        default=1000,
++        metadata={"help": "Number of examples to split out from training to use for evaluation."},
++    )
+ 
+ 
+ @dataclass
+@@ -89,6 +93,21 @@ def main():
+     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+     os.environ["WANDB_PROJECT"] = training_args.wandb_project
+ 
++    tokenizer = transformers.AutoTokenizer.from_pretrained(
++        model_args.model_name_or_path,
++        cache_dir=training_args.cache_dir,
++        model_max_length=training_args.model_max_length,
++        padding_side="right",  # Ensures properly masking out the source tokens.
++        use_fast=training_args.use_fast_tokenizer,
++    )
++    tokenizer.padding = training_args.padding
++
++    data_module: dict = data_utils.make_supervised_data_module(
++        tokenizer=tokenizer,
++        data_args=data_args,
++        training_args=training_args,
++    )
++
+     if training_args.deepspeed is not None:
+         ctx_mgr = contextlib.nullcontext()
+         device_map = None
+@@ -117,15 +136,6 @@ def main():
+         )
+         common.let_model_save_mem_when_zero_grad(model)
+ 
+-    tokenizer = transformers.AutoTokenizer.from_pretrained(
+-        model_args.model_name_or_path,
+-        cache_dir=training_args.cache_dir,
+-        model_max_length=training_args.model_max_length,
+-        padding_side="right",  # Ensures properly masking out the source tokens.
+-        use_fast=training_args.use_fast_tokenizer,
+-    )
+-    tokenizer.padding = training_args.padding
+-
+     # Collect special tokens. Only add if non-existent.
+     special_tokens_dict = dict(additional_special_tokens=[])
+     if tokenizer.pad_token is None:
+@@ -138,12 +148,6 @@ def main():
+         special_tokens_dict["unk_token"] = constants.DEFAULT_UNK_TOKEN
+     utils.stable_resize_token_embeddings_and_tokenizer(model, tokenizer, special_tokens_dict)
+ 
+-    data_module: dict = data_utils.make_supervised_data_module(
+-        tokenizer=tokenizer,
+-        data_args=data_args,
+-        training_args=training_args,
+-    )
+-
+     # Tokenizer is only supplied so that it gets saved; this makes loading easier.
+     trainer = Trainer(
+         model=model,
+diff --git a/pretrained_models/convert_llama7b_to_alpacafarm_format.py b/pretrained_models/convert_llama7b_to_alpacafarm_format.py
+new file mode 100644
+index 0000000..2bb60a5
+--- /dev/null
++++ b/pretrained_models/convert_llama7b_to_alpacafarm_format.py
+@@ -0,0 +1,100 @@
++# this script is adapted from recover_model_weights.py, in the same folder
++
++import os
++import argparse
++import numpy as np
++import torch
++import transformers
++from huggingface_hub import HfApi, hf_hub_download
++
++from alpaca_farm.models.reward_model import RewardModel
++from alpaca_farm.utils import stable_resize_token_embeddings_and_tokenizer
++
++
++def get_alpaca_farm_model_names():
++    api = HfApi()
++    models = api.list_models(author='tatsu-lab', search='alpaca-farm')
++    model_names = [model.modelId for model in models]
++    model_names = [name.replace('tatsu-lab/alpaca-farm-', '').replace('-wdiff', '') for name in model_names]
++    return model_names
++
++
++def build_argparse(model_names):
++    parser = argparse.ArgumentParser('Download AlpacaFarm models')
++    parser.add_argument('--in-dir', type=str, required=True)
++    parser.add_argument('--out-dir', default='./pretrained_models', type=str)
++    parser.add_argument('--device', default='cpu', type=str)
++    args = parser.parse_args()
++    return args
++
++
++def load_weight_diff(hf_hub_name, is_reward_model=False, device="cpu"):
++    if is_reward_model:
++        model_tuned = RewardModel.from_pretrained(
++            hf_hub_name, device_map={"": torch.device(device)}, torch_dtype=torch.float32, flash_attn=False
++        )
++    else:
++        model_tuned = transformers.AutoModelForCausalLM.from_pretrained(
++            hf_hub_name, device_map={"": torch.device(device)}, torch_dtype=torch.float32
++        )
++    tokenizer_tuned = transformers.AutoTokenizer.from_pretrained(hf_hub_name)
++    return model_tuned.eval(), tokenizer_tuned
++
++
++def load_raw_model(model_dir, device="cpu"):
++    model_raw = transformers.AutoModelForCausalLM.from_pretrained(
++        model_dir, device_map={"": torch.device(device)}, torch_dtype=torch.float32
++    )
++    tokenizer_raw = transformers.AutoTokenizer.from_pretrained(model_dir)
++    if tokenizer_raw.pad_token is None:
++        stable_resize_token_embeddings_and_tokenizer(
++            model=model_raw, tokenizer=tokenizer_raw, special_tokens_dict=dict(pad_token="[PAD]")
++        )
++    return model_raw.eval(), tokenizer_raw
++
++
++def reconstruct_tuned_model(model_tuned, model_raw, is_reward_model=False):
++    # modifies model_tuned in-place
++    state_dict_diff = model_tuned.state_dict()
++    state_dict_raw = model_raw.state_dict()
++    if is_reward_model:
++        # reward model adds nesting to main transformer
++        state_dict_raw = {f"backbone_model.{k}": v for k, v in state_dict_raw.items()}
++    for key in state_dict_raw:
++        if state_dict_raw[key].size() != state_dict_diff[key].size():
++            # weights with a size mismatch are not diff'd in the upload
++            continue
++        # state_dict_diff[key].add_(state_dict_raw[key])
++        state_dict_diff[key].mul_(0).add_(state_dict_raw[key]) # used to get LLaMA in the right format
++
++
++def integrity_check(model_tuned, hf_hub_name):
++    model_sum = sum(param.sum() for param in model_tuned.state_dict().values()).item()
++    model_sum_file = hf_hub_download(repo_id=hf_hub_name, filename="model_sum.txt")
++    with open(model_sum_file, "r") as f:
++        model_sum_hf_hub = float(f.read())
++    return np.isclose(model_sum_hf_hub, model_sum)
++
++
++if __name__ == "__main__":
++    model_names = get_alpaca_farm_model_names()
++    args = build_argparse(model_names)
++
++    model_names = ['sft10k']
++    for model_name in model_names:
++        # print('Downloading', model_name)
++
++        hf_hub_name = f"tatsu-lab/alpaca-farm-{model_name}-wdiff"
++        is_reward_model = 'reward-model' in model_name
++        save_dir = os.path.join(args.out_dir, 'llama7b')
++
++        model_tuned, tokenizer_tuned = load_weight_diff(hf_hub_name, is_reward_model, args.device)
++        model_raw, tokenizer_raw = load_raw_model(args.in_dir, args.device)
++        reconstruct_tuned_model(model_tuned, model_raw, is_reward_model)
++
++        # if not integrity_check(model_tuned, hf_hub_name):
++        #     print("Model weights integrity check failed. Did you use the latest llama-7b HF weights?")
++        model_tuned.save_pretrained(save_dir)
++        tokenizer_tuned.save_pretrained(save_dir)
++
++        # print('Downloaded to', save_dir)
+\ No newline at end of file
+diff --git a/src/alpaca_farm/common.py b/src/alpaca_farm/common.py
+index 46ae331..64b8521 100644
+--- a/src/alpaca_farm/common.py
++++ b/src/alpaca_farm/common.py
+@@ -167,7 +167,7 @@ def safe_save_model_for_hf_trainer(
+         # Once we migrate, we can also implement more efficient loading:
+         # https://github.com/pytorch/pytorch/blob/master/torch/distributed/fsdp/api.py#L286-L295
+         # NOTE(tianyi): tested on sphinx6, seems to work fine with rank0_only=False
+-        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=rank0_only)
++        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=False) # had to change rank0_only to make this work on our infra
+         with FSDP.state_dict_type(trainer.model, StateDictType.FULL_STATE_DICT, cfg):
+             state_dict = trainer.model.state_dict()
+             if trainer.args.should_save:
+diff --git a/src/alpaca_farm/data_preprocessor.py b/src/alpaca_farm/data_preprocessor.py
+index ca0eff9..88c3e5e 100644
+--- a/src/alpaca_farm/data_preprocessor.py
++++ b/src/alpaca_farm/data_preprocessor.py
+@@ -162,7 +162,8 @@ def preprocess_for_sft(
+         df = df_postprocessor(df)
+     list_dict_data = df.to_dict(orient="records")
+ 
+-    sources = [format_prompt(dict_data, prompt_dict) for dict_data in list_dict_data]
++    # sources = [format_prompt(dict_data, prompt_dict) for dict_data in list_dict_data]
++    sources = [dict_data['instruction'] + ' ' for dict_data in list_dict_data]
+     targets = [format_output(dict_data, eos_token=tokenizer.eos_token) for dict_data in list_dict_data]
+ 
+     examples = [s + t for s, t in utils.zip_(sources, targets)]
+@@ -214,7 +215,7 @@ def preprocess_for_reward_modeling(
+             eos_token=tokenizer.eos_token if end_sequence_with_eos else None,
+             output_key=output_key,
+         )
+-        return source + target
++        return example['instruction'] + ' ' + target
+ 
+     text_list_0, text_list_1 = tuple(
+         [_get_text(dict_data, key) for dict_data in list_dict_data] for key in ("output_1", "output_2")
+@@ -354,6 +355,11 @@ class BinaryRewardModelingDataset(Dataset):
+         self.choice = data_dict["choice"]
+         self.metadata = data_dict["metadata"]
+ 
++        if 'win2_prob' in df.keys():
++            self.loss_choice = torch.Tensor(df['win2_prob'].tolist()).view(-1, 1)
++        else:
++            self.loss_choice = self.choice
++
+     def __len__(self):
+         return len(self.input_ids)
+ 
+@@ -364,6 +370,7 @@ class BinaryRewardModelingDataset(Dataset):
+             index_0=self.index_0[i],
+             index_1=self.index_1[i],
+             choice=self.choice[i],
++            loss_choice=self.loss_choice[i],
+         )
+ 
+ 
+@@ -401,8 +408,8 @@ class DataCollatorForBinaryRewardModelingDataset(object):
+         return input_ids
+ 
+     def __call__(self, instances: Sequence[Dict]) -> Dict[str, Tensor]:
+-        index_0, index_1, choice = tuple(
+-            torch.stack([instance[key] for instance in instances]) for key in ("index_0", "index_1", "choice")
++        index_0, index_1, choice, loss_choice = tuple(
++            torch.stack([instance[key] for instance in instances]) for key in ("index_0", "index_1", "choice", "loss_choice")
+         )
+         input_ids = self._left_pad_helper(instances, "input_ids")
+         attention_mask = input_ids.ne(self.tokenizer.pad_token_id).long()
+@@ -412,6 +419,7 @@ class DataCollatorForBinaryRewardModelingDataset(object):
+             index_0=index_0,
+             index_1=index_1,
+             choice=choice,
++            loss_choice=loss_choice
+         )
+ 
+ 
+@@ -433,7 +441,8 @@ class QueryResponseDataset(Dataset):
+         list_dict_data = df.to_dict(orient="records")
+ 
+         # prompts are strings; queries are tensors.
+-        prompts = [format_prompt(example=dict_data, prompt_dict=prompt_dict) for dict_data in list_dict_data]
++        # prompts = [format_prompt(example=dict_data, prompt_dict=prompt_dict) for dict_data in list_dict_data]
++        prompts = [dict_data['instruction'] for dict_data in list_dict_data]
+         queries = [
+             tokenizer(prompt, return_tensors="pt", truncation=False).input_ids.squeeze(dim=0) for prompt in prompts
+         ]
+diff --git a/src/alpaca_farm/data_utils.py b/src/alpaca_farm/data_utils.py
+index 4ebe920..7c7aada 100644
+--- a/src/alpaca_farm/data_utils.py
++++ b/src/alpaca_farm/data_utils.py
+@@ -35,20 +35,51 @@ def make_supervised_data_module(
+ ):
+     prompt_dict = utils.jload(data_args.prompt_dict_path)
+ 
+-    alpaca_instructions = datasets.load_dataset(data_args.dataset_path, data_args.dataset_name)
+-    train_df = pd.concat([pd.DataFrame(alpaca_instructions[split]) for split in data_args.train_splits])
+-    eval_df = pd.concat([pd.DataFrame(alpaca_instructions[split]) for split in data_args.eval_splits])
+-
+-    train_dataset = SFTDataset(
+-        df=train_df,
+-        prompt_dict=prompt_dict,
+-        tokenizer=tokenizer,
+-    )
+-    eval_dataset = SFTDataset(
+-        df=eval_df,
+-        prompt_dict=prompt_dict,
+-        tokenizer=tokenizer,
+-    )
++    try:
++        alpaca_instructions = datasets.load_dataset(data_args.dataset_path, data_args.dataset_name)
++        train_df = pd.concat([pd.DataFrame(alpaca_instructions[split]) for split in data_args.train_splits])
++        eval_df = pd.concat([pd.DataFrame(alpaca_instructions[split]) for split in data_args.eval_splits])
++        train_dataset = SFTDataset(
++            df=train_df,
++            prompt_dict=prompt_dict,
++            tokenizer=tokenizer,
++        )
++        eval_dataset = SFTDataset(
++            df=eval_df,
++            prompt_dict=prompt_dict,
++            tokenizer=tokenizer,
++        )
++    except:
++        train_df = pd.read_csv(data_args.dataset_name)
++        # convert input column to str
++        train_df["input"] = train_df["input"].astype(str)
++        for i in range(len(train_df)):
++            train_df.at[i, 'input'] = ''
++            if type(train_df.at[i, 'instruction']) == float:
++                train_df.at[i, 'instruction'] = ''
++            if type(train_df.at[i, 'output']) == float:
++                train_df.at[i, 'output'] = ''
++            train_df.at[i, 'output'] = train_df.at[i, 'output'].rstrip() + '\n\nHuman:'
++        train_dataset = SFTDataset(
++            df=train_df,
++            prompt_dict=prompt_dict,
++            tokenizer=tokenizer,
++        )
++        eval_df = pd.read_csv(data_args.dataset_name.replace('train.csv', 'dev.csv'))
++        # convert input column to str
++        eval_df["input"] = eval_df["input"].astype(str)
++        for i in range(len(eval_df)):
++            eval_df.at[i, 'input'] = ''
++            if type(eval_df.at[i, 'instruction']) == float:
++                eval_df.at[i, 'instruction'] = ''
++            if type(eval_df.at[i, 'output']) == float:
++                eval_df.at[i, 'output'] = ''
++            eval_df.at[i, 'output'] = eval_df.at[i, 'output'].rstrip() + '\n\nHuman:'
++        eval_dataset = SFTDataset(
++            df=eval_df,
++            prompt_dict=prompt_dict,
++            tokenizer=tokenizer,
++        )
+ 
+     data_collator = DataCollatorForSFTDataset(tokenizer=tokenizer)
+     return dict(train_dataset=train_dataset, eval_dataset=eval_dataset, data_collator=data_collator)
+@@ -61,8 +92,24 @@ def make_binary_reward_modeling_data_module(
+ ):
+     prompt_dict = utils.jload(data_args.prompt_dict_path)
+ 
+-    alpaca_human_preference = datasets.load_dataset(data_args.dataset_path, data_args.dataset_name)
+-    train_df = pd.DataFrame(alpaca_human_preference["preference"])
++    try:
++        alpaca_human_preference = datasets.load_dataset(data_args.dataset_path, data_args.dataset_name)
++        train_df = pd.DataFrame(alpaca_human_preference["preference"])
++        train_df = train_df.truncate(after=1010)
++    except:
++        train_df = pd.read_csv(data_args.dataset_name)
++        # convert input column to str
++        train_df["input"] = train_df["input"].astype(str)
++        for i in range(len(train_df)):
++            train_df.at[i, 'input'] = ''
++            if type(train_df.at[i, 'instruction']) == float:
++                train_df.at[i, 'instruction'] = ''
++            if type(train_df.at[i, 'output_1']) == float:
++                train_df.at[i, 'output_1'] = ''
++            if type(train_df.at[i, 'output_2']) == float:
++                train_df.at[i, 'output_2'] = ''
++            train_df.at[i, 'output_1'] = train_df.at[i, 'output_1'].rstrip() + '\n\nHuman:'
++            train_df.at[i, 'output_2'] = train_df.at[i, 'output_2'].rstrip() + '\n\nHuman:'
+ 
+     train_dataset = BinaryRewardModelingDataset(
+         df=train_df,
+@@ -86,9 +133,21 @@ def make_rl_data_module(
+ ):
+     prompt_dict = utils.jload(data_args.prompt_dict_path)
+ 
+-    alpaca_instructions = datasets.load_dataset(data_args.dataset_path, data_args.dataset_name)
+-    train_df = pd.concat([pd.DataFrame(alpaca_instructions[split]) for split in data_args.train_splits])
+-    eval_df = pd.concat([pd.DataFrame(alpaca_instructions[split]) for split in data_args.eval_splits])
++    try:
++        alpaca_instructions = datasets.load_dataset(data_args.dataset_path, data_args.dataset_name)
++        train_df = pd.concat([pd.DataFrame(alpaca_instructions[split]) for split in data_args.train_splits])
++        eval_df = pd.concat([pd.DataFrame(alpaca_instructions[split]) for split in data_args.eval_splits])
++    except:
++        train_df = pd.read_csv(data_args.dataset_name)
++        # convert input column to str
++        train_df["input"] = train_df["input"].astype(str)
++        for i in range(len(train_df)):
++            train_df.at[i, 'input'] = ''
++        eval_df = pd.read_csv(data_args.dataset_name.replace('train', 'val'))
++        # convert input column to str
++        eval_df["input"] = eval_df["input"].astype(str)
++        for i in range(len(eval_df)):
++            eval_df.at[i, 'input'] = ''
+ 
+     train_dataset = QueryResponseDataset(
+         df=train_df,
+diff --git a/src/alpaca_farm/inference/decode.py b/src/alpaca_farm/inference/decode.py
+index 48a6435..f8ee75d 100644
+--- a/src/alpaca_farm/inference/decode.py
++++ b/src/alpaca_farm/inference/decode.py
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import os
+ import copy
+ import dataclasses
+ import math
+@@ -80,7 +81,11 @@ def load_model_and_tokenizer_for_inference(
+         tokenizer_kwargs = default_tokenizer_kwargs
+ 
+     model = model_cls.from_pretrained(model_name_or_path, **model_kwargs).eval()
+-    tokenizer = transformers.AutoTokenizer.from_pretrained(model_name_or_path, **tokenizer_kwargs)
++    try:
++        tokenizer = transformers.AutoTokenizer.from_pretrained(model_name_or_path, **tokenizer_kwargs)
++    except:
++        # tokenizer = transformers.AutoTokenizer.from_pretrained(os.path.expanduser('~') + '/alpaca_farm/pretrained_models/llama7b', **tokenizer_kwargs)
++        tokenizer = transformers.AutoTokenizer.from_pretrained('/'.join(os.path.abspath(__file__).split('/')[:-3] + ['pretrained_models', 'llama7b']), **tokenizer_kwargs)
+     if tokenizer.pad_token is None:
+         # base llama does not come with a pad token, possible for other pretrained models as well
+         tokenizer.add_special_tokens({"pad_token": constants.DEFAULT_PAD_TOKEN})
+@@ -174,7 +179,6 @@ def decode_prompts_with_huggingface_given_model(
+         disable=not distributed_utils.is_main_process(),
+     ):
+         batch = new_prompts[start_idx : start_idx + per_device_batch_size]
+-
+         source = tokenizer(batch, return_tensors="pt", padding=True)
+         source = common.prepare_inputs(source, device=device)
+         inputs, attention_mask = source.input_ids, source.attention_mask
+diff --git a/src/alpaca_farm/inference/score.py b/src/alpaca_farm/inference/score.py
+index 20be427..a97a122 100644
+--- a/src/alpaca_farm/inference/score.py
++++ b/src/alpaca_farm/inference/score.py
+@@ -176,6 +176,7 @@ def rerank_sequences_with_huggingface(
+     )
+     rewards = einops.rearrange(torch.tensor(rewards), "(b m) -> b m", m=len(sequences[0]))
+     # Nested list of "size" (data_size, num_options).
++    top_rewards = rewards.topk(rerank_top_k, dim=1).values.cpu().tolist()
+     top_indices = rewards.topk(rerank_top_k, dim=1).indices.tolist()
+     top_sequences = [[sequence[i] for i in top_index] for sequence, top_index in utils.zip_(sequences, top_indices)]
+-    return top_sequences, top_indices
++    return top_sequences, top_indices, top_rewards
+diff --git a/src/alpaca_farm/reward_modeling_trainer.py b/src/alpaca_farm/reward_modeling_trainer.py
+index b74eaa3..3c87957 100644
+--- a/src/alpaca_farm/reward_modeling_trainer.py
++++ b/src/alpaca_farm/reward_modeling_trainer.py
+@@ -13,6 +13,7 @@
+ # limitations under the License.
+ 
+ from typing import Dict
++import pickle
+ 
+ import einops
+ import torch
+@@ -28,8 +29,8 @@ class Trainer(transformers.Trainer):
+         # input_ids, attention_mask each of size (bsz, num_candidates, seq_len).
+         # index_0, index_1 each of size (bsz, num_pairs); indexes into input_ids.
+         # choice of size (bsz, num_pairs); 1 if index_1's seq is chosen, 0 otherwise.
+-        input_ids, attention_mask, index_0, index_1, choice = common.unpack_dict(
+-            inputs, keys=("input_ids", "attention_mask", "index_0", "index_1", "choice")
++        input_ids, attention_mask, index_0, index_1, choice, loss_choice = common.unpack_dict(
++            inputs, keys=("input_ids", "attention_mask", "index_0", "index_1", "choice", "loss_choice")
+         )
+         num_candidates, num_pairs = input_ids.size(1), choice.size(1)
+         input_ids_flat, attention_mask_flat = tuple(
+@@ -44,7 +45,7 @@ class Trainer(transformers.Trainer):
+         )  # Size: (bsz, num_pairs).
+         logits = rewards_1 - rewards_0  # Size: (bsz, num_pairs).
+         # Type casting of `choice` is due to amp.autocast context manager.
+-        loss = F.binary_cross_entropy_with_logits(logits, choice.to(logits.dtype), reduction="mean")
++        loss = F.binary_cross_entropy_with_logits(logits, loss_choice.to(logits.dtype), reduction="mean")
+         return (loss, dict(logits=logits)) if return_outputs else loss
+ 
+ 
+diff --git a/src/alpaca_farm/rl/ppo_trainer.py b/src/alpaca_farm/rl/ppo_trainer.py
+index 37d786b..4ec4543 100644
+--- a/src/alpaca_farm/rl/ppo_trainer.py
++++ b/src/alpaca_farm/rl/ppo_trainer.py
+@@ -156,10 +156,13 @@ class PPOTrainer(rl_trainer.RLTrainer):
+                 for tensor in (queries, responses)
+             )
+             del queries, responses  # Prevent mistakes.
++            for response_idx in range(len(text_responses)):
++                if '\n\nHuman:' in text_responses[response_idx]:
++                    text_responses[response_idx] = text_responses[response_idx].split('\n\nHuman:')[0] + '\n\nHuman:'
+ 
+             # We retokenizer, since policy and reward model might not have the same tokenizer.
+             # TODO(lxuechen): Avoid retokenization when policy and reward tokenizer are the same.
+-            text_sequences = [q + r for q, r in utils.zip_(text_queries, text_responses)]
++            text_sequences = [q + ' ' + r for q, r in utils.zip_(text_queries, text_responses)]
+             # TODO(lxuechen): This response retokenization has issues with OPT, since the tokenizer always prepend
+             #  <bos_token>. But the issue is local to post_reward, which isn't an issue if we don't penalize.
+             sequences, responses = tuple(
+@@ -169,7 +172,7 @@ class PPOTrainer(rl_trainer.RLTrainer):
+             sequences, responses = common.prepare_inputs((sequences, responses), device=self.accelerator.device)
+ 
+             reward_outputs = self.reward_model(**sequences)
+-            reward_outputs = self.post_reward(reward_outputs, responses.input_ids)
++            reward_outputs = self.post_reward(reward_outputs, responses.input_ids, text_responses)
+             rollouts_batch.update(reward_outputs)
+ 
+             # Shape reward with KL penalty.
+@@ -194,8 +197,12 @@ class PPOTrainer(rl_trainer.RLTrainer):
+         advantages = {key: value.cpu() for key, value in advantages.items()}
+         return {**rollouts, **advantages}
+ 
+-    def post_reward(self, reward_outputs: Dict[str, Tensor], responses: Tensor) -> Dict[str, Tensor]:
++    def post_reward(self, reward_outputs: Dict[str, Tensor], responses: Tensor, text_responses) -> Dict[str, Tensor]:
+         """Assign bad reward values to sequences which didn't stop properly."""
++        for i in range(len(text_responses)):
++            if not text_responses[i].endswith('\n\nHuman:') or len(text_responses[i].split('\n\nHuman:')[0].strip()) == 0:
++                reward_outputs["rewards"][i] = self.args.penalty_reward_value
++
+         if self.args.truncate_token_ids is None:
+             return reward_outputs
+ 
+diff --git a/src/alpaca_farm/rl/ppo_utils.py b/src/alpaca_farm/rl/ppo_utils.py
+index db82afa..60ed562 100644
+--- a/src/alpaca_farm/rl/ppo_utils.py
++++ b/src/alpaca_farm/rl/ppo_utils.py
+@@ -61,6 +61,7 @@ class TrainingArguments(transformers.TrainingArguments):
+             "e.g., due to outputting incomplete sentences for given context window."
+         },
+     )
++    total_steps: int = field(default=80)
+     total_epochs: int = field(default=10)
+     rollout_batch_size: int = field(default=512)
+     step_batch_size: int = field(default=256)
+diff --git a/src/alpaca_farm/rl/rl_trainer.py b/src/alpaca_farm/rl/rl_trainer.py
+index 45eba5d..e53b1c8 100644
+--- a/src/alpaca_farm/rl/rl_trainer.py
++++ b/src/alpaca_farm/rl/rl_trainer.py
+@@ -175,7 +175,8 @@ class RLTrainer(object):
+         """Entry point for training."""
+         total_epochs = self.args.total_epochs
+         total_episodes = len(self.train_dataset) * total_epochs  # noqa
+-        total_steps = total_episodes // self.args.rollout_batch_size  # noqa
++        # total_steps = total_episodes // self.args.rollout_batch_size  # noqa
++        total_steps = self.args.total_steps # we don't need more than this
+         logger.warning(
+             f"***Training starts***\n"
+             f"Total epochs: {total_epochs} => Total episodes: {total_episodes} => Total steps: {total_steps}"
+-- 
+2.31.1
+
